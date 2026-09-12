@@ -1,6 +1,8 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
+use jsonl_peek::json::{self, Value};
+
 fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_jsonl-peek"))
 }
@@ -102,6 +104,43 @@ fn stats_reports_a_missing_file_as_a_runtime_error() {
         .output()
         .expect("run jsonl-peek stats");
     assert_eq!(output.status.code(), Some(1));
+}
+
+#[test]
+fn stats_json_output_is_valid_json_with_the_expected_fields() {
+    let stdout = stats_on(
+        b"{\"role\":\"user\"}\n{\"role\":\"assistant\"}\n\nbad\n",
+        &["--json", "--field", "role"],
+    );
+    let value = json::parse(stdout.trim().as_bytes())
+        .expect("stats --json output should itself be valid json");
+
+    assert_eq!(value.get("lines"), Some(&Value::Int(4)));
+    assert_eq!(value.get("blank"), Some(&Value::Int(1)));
+    assert_eq!(value.get("invalid"), Some(&Value::Int(1)));
+    assert_eq!(value.get("valid"), Some(&Value::Int(2)));
+    assert_eq!(value.get("top_level_types").unwrap().get("object"), Some(&Value::Int(2)));
+
+    let fields = value.get("fields").unwrap().as_array().unwrap();
+    assert_eq!(fields.len(), 1);
+    assert_eq!(fields[0].get("path"), Some(&Value::String("role".to_string())));
+    assert_eq!(fields[0].get("records_present"), Some(&Value::Int(2)));
+    // Both values occur once; ties break on the rendered text, so
+    // "assistant" (starts with 'a') sorts ahead of "user".
+    let top = fields[0].get("top").unwrap().as_array().unwrap();
+    assert_eq!(top[0].get("value"), Some(&Value::String("\"assistant\"".to_string())));
+    assert_eq!(top[0].get("count"), Some(&Value::Int(1)));
+
+    let issues = value.get("issues").unwrap().as_array().unwrap();
+    assert_eq!(issues.len(), 1);
+    assert_eq!(issues[0].get("line"), Some(&Value::Int(4)));
+}
+
+#[test]
+fn stats_json_reports_an_empty_line_length_histogram_without_dividing_by_zero() {
+    let stdout = stats_on(b"", &["--json"]);
+    let value = json::parse(stdout.trim().as_bytes()).unwrap();
+    assert_eq!(value.get("line_length").unwrap().get("count"), Some(&Value::Int(0)));
 }
 
 #[test]

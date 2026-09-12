@@ -4,10 +4,12 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use jsonl_peek::hist::Histogram;
+use jsonl_peek::json::Json;
 use jsonl_peek::lines::LineReader;
 use jsonl_peek::path::FieldPath;
 use jsonl_peek::rng::{Reservoir, SplitMix64};
-use jsonl_peek::stats::{Stats, StatsOptions};
+use jsonl_peek::stats::{FieldStats, Issue, Stats, StatsOptions};
 
 fn main() -> ExitCode {
     match run() {
@@ -222,6 +224,7 @@ struct StatsArgs {
     fields: Vec<FieldPath>,
     top: usize,
     max_errors: usize,
+    json: bool,
     file: Option<String>,
 }
 
@@ -229,6 +232,7 @@ fn parse_stats_args(mut args: impl Iterator<Item = String>) -> Result<StatsArgs,
     let mut fields = Vec::new();
     let mut top = 10usize;
     let mut max_errors = 10usize;
+    let mut json = false;
     let mut file = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -247,19 +251,21 @@ fn parse_stats_args(mut args: impl Iterator<Item = String>) -> Result<StatsArgs,
                     .ok_or_else(|| "--max-errors requires a value".to_string())?;
                 max_errors = value.parse().map_err(|_| format!("invalid count '{value}'"))?;
             }
+            "--json" => json = true,
             "-" => file = Some(arg),
             _ if arg.starts_with('-') => return Err(format!("unknown option '{arg}'")),
             _ if file.is_some() => return Err("too many file arguments".to_string()),
             _ => file = Some(arg),
         }
     }
-    Ok(StatsArgs { fields, top, max_errors, file })
+    Ok(StatsArgs { fields, top, max_errors, json, file })
 }
 
 fn run_stats(args: StatsArgs) -> io::Result<ExitCode> {
     let stdout = io::stdout();
     let mut out = stdout.lock();
     let top = args.top;
+    let json = args.json;
     let options = StatsOptions { fields: args.fields, top: args.top, max_errors: args.max_errors };
 
     match args.file.as_deref() {
@@ -268,15 +274,99 @@ fn run_stats(args: StatsArgs) -> io::Result<ExitCode> {
                 .map_err(|err| io::Error::new(err.kind(), format!("{path}: {err}")))?;
             let bytes = file.metadata().ok().map(|meta| meta.len());
             let stats = Stats::from_reader(BufReader::new(file), options)?;
-            print_stats(&stats, top, path, bytes, &mut out)?;
+            if json {
+                print_stats_json(&stats, top, path, bytes, &mut out)?;
+            } else {
+                print_stats(&stats, top, path, bytes, &mut out)?;
+            }
         }
         _ => {
             let stdin = io::stdin();
             let stats = Stats::from_reader(stdin.lock(), options)?;
-            print_stats(&stats, top, "-", None, &mut out)?;
+            if json {
+                print_stats_json(&stats, top, "-", None, &mut out)?;
+            } else {
+                print_stats(&stats, top, "-", None, &mut out)?;
+            }
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn print_stats_json<W: Write>(
+    stats: &Stats,
+    top: usize,
+    file_label: &str,
+    bytes: Option<u64>,
+    out: &mut W,
+) -> io::Result<()> {
+    stats_to_json(stats, top, file_label, bytes).write(out)?;
+    writeln!(out)
+}
+
+fn stats_to_json(stats: &Stats, top: usize, file_label: &str, bytes: Option<u64>) -> Json {
+    let invalid = stats.lines - stats.blank - stats.valid;
+    let mut members = vec![
+        ("file", Json::Str(file_label.to_string())),
+        ("lines", Json::UInt(stats.lines as u64)),
+        ("blank", Json::UInt(stats.blank as u64)),
+        ("invalid", Json::UInt(invalid as u64)),
+        ("valid", Json::UInt(stats.valid as u64)),
+    ];
+    if let Some(bytes) = bytes {
+        members.push(("bytes", Json::UInt(bytes)));
+    }
+    members.push(("top_level_types", type_counts_json(&stats.top_level_types.most_common())));
+    members.push(("line_length", line_length_json(&stats.line_length)));
+    members.push(("fields", Json::Array(stats.fields.iter().map(|field| field_json(field, top)).collect())));
+    members.push(("issues", Json::Array(stats.issues.iter().map(issue_json).collect())));
+    members.push(("issues_truncated", Json::Bool(stats.issues_truncated)));
+    Json::Object(members)
+}
+
+fn type_counts_json(counts: &[(&'static str, u64)]) -> Json {
+    Json::Object(counts.iter().map(|&(name, count)| (name, Json::UInt(count))).collect())
+}
+
+fn line_length_json(hist: &Histogram) -> Json {
+    Json::Object(vec![
+        ("count", Json::UInt(hist.count())),
+        ("min", Json::UInt(hist.min().unwrap_or(0))),
+        ("p50", Json::UInt(hist.percentile(0.5).unwrap_or(0))),
+        ("p90", Json::UInt(hist.percentile(0.9).unwrap_or(0))),
+        ("p99", Json::UInt(hist.percentile(0.99).unwrap_or(0))),
+        ("max", Json::UInt(hist.max().unwrap_or(0))),
+        ("mean", Json::Float(hist.mean().unwrap_or(0.0))),
+    ])
+}
+
+fn field_json(field: &FieldStats, top: usize) -> Json {
+    Json::Object(vec![
+        ("path", Json::Str(field.path.to_string())),
+        ("records_present", Json::UInt(field.records_present as u64)),
+        ("value_count", Json::UInt(field.value_count)),
+        ("types", type_counts_json(&field.types.most_common())),
+        ("distinct", Json::UInt(field.distinct() as u64)),
+        ("values_truncated", Json::Bool(field.values_truncated)),
+        (
+            "top",
+            Json::Array(
+                field
+                    .top(top)
+                    .into_iter()
+                    .map(|(value, count)| Json::Object(vec![("value", Json::Str(value.to_string())), ("count", Json::UInt(count))]))
+                    .collect(),
+            ),
+        ),
+    ])
+}
+
+fn issue_json(issue: &Issue) -> Json {
+    Json::Object(vec![
+        ("line", Json::UInt(issue.line as u64)),
+        ("column", Json::UInt(issue.column as u64)),
+        ("reason", Json::Str(issue.reason.clone())),
+    ])
 }
 
 fn print_stats<W: Write>(
@@ -401,7 +491,7 @@ fn format_bytes(n: u64) -> String {
 fn usage() {
     eprintln!("usage: jsonl-peek head   [-n N] [FILE]");
     eprintln!("       jsonl-peek sample [-n N] [--seed S] [FILE]");
-    eprintln!("       jsonl-peek stats  [--field PATH]... [--top N] [--max-errors N] [FILE]");
+    eprintln!("       jsonl-peek stats  [--field PATH]... [--top N] [--max-errors N] [--json] [FILE]");
 }
 
 #[cfg(test)]

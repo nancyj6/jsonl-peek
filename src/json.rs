@@ -1,4 +1,5 @@
 use std::fmt;
+use std::io;
 
 /// A parsed JSON value. Objects keep members in the order they appeared in
 /// the source; duplicate keys are kept rather than merged, since deciding
@@ -47,6 +48,108 @@ impl Value {
     pub fn get(&self, key: &str) -> Option<&Value> {
         self.as_object()?.iter().find(|(k, _)| k == key).map(|(_, v)| v)
     }
+}
+
+/// A JSON value under construction for `--json` output. Kept separate from
+/// `Value`, which only ever holds *parsed* input: the two enums serve
+/// opposite directions of the format, and `Value` has no `UInt` or a way to
+/// keep object keys as `&'static str` without an allocation per report.
+pub enum Json {
+    Bool(bool),
+    UInt(u64),
+    Float(f64),
+    Str(String),
+    Array(Vec<Json>),
+    Object(Vec<(&'static str, Json)>),
+}
+
+impl Json {
+    /// Writes the value as pretty-printed JSON with a 2-space indent and no
+    /// trailing newline.
+    pub fn write<W: io::Write>(&self, out: &mut W) -> io::Result<()> {
+        self.write_indented(out, 0)
+    }
+
+    fn write_indented<W: io::Write>(&self, out: &mut W, depth: usize) -> io::Result<()> {
+        match self {
+            Json::Bool(b) => write!(out, "{b}"),
+            Json::UInt(n) => write!(out, "{n}"),
+            Json::Float(f) => write!(out, "{}", format_float(*f)),
+            Json::Str(s) => write_json_string(out, s),
+            Json::Array(items) => {
+                write_seq(out, depth, items.len(), items.iter(), '[', ']', |out: &mut W, item: &Json, inner: usize| {
+                    item.write_indented(out, inner)
+                })
+            }
+            Json::Object(members) => write_seq(
+                out,
+                depth,
+                members.len(),
+                members.iter(),
+                '{',
+                '}',
+                |out: &mut W, entry: &(&'static str, Json), inner: usize| {
+                    write_json_string(out, entry.0)?;
+                    write!(out, ": ")?;
+                    entry.1.write_indented(out, inner)
+                },
+            ),
+        }
+    }
+}
+
+/// Shared body of the array and object writers: an opening bracket, one
+/// indented, comma-separated entry per line via `write_entry`, and a closing
+/// bracket aligned with the opening one.
+fn write_seq<W, I, F>(out: &mut W, depth: usize, len: usize, items: I, open: char, close: char, write_entry: F) -> io::Result<()>
+where
+    W: io::Write,
+    I: Iterator,
+    F: Fn(&mut W, I::Item, usize) -> io::Result<()>,
+{
+    if len == 0 {
+        return write!(out, "{open}{close}");
+    }
+    writeln!(out, "{open}")?;
+    let inner = depth + 1;
+    for (i, item) in items.enumerate() {
+        write!(out, "{:indent$}", "", indent = inner * 2)?;
+        write_entry(out, item, inner)?;
+        if i + 1 < len {
+            write!(out, ",")?;
+        }
+        writeln!(out)?;
+    }
+    write!(out, "{:indent$}{close}", "", indent = depth * 2)
+}
+
+fn write_json_string<W: io::Write>(out: &mut W, s: &str) -> io::Result<()> {
+    write!(out, "\"")?;
+    for ch in s.chars() {
+        match ch {
+            '"' => write!(out, "\\\"")?,
+            '\\' => write!(out, "\\\\")?,
+            '\n' => write!(out, "\\n")?,
+            '\r' => write!(out, "\\r")?,
+            '\t' => write!(out, "\\t")?,
+            c if (c as u32) < 0x20 => write!(out, "\\u{:04x}", c as u32)?,
+            c => write!(out, "{c}")?,
+        }
+    }
+    write!(out, "\"")
+}
+
+/// Renders a float to at most 4 decimal places with trailing zeros (and a
+/// bare trailing dot) trimmed, e.g. `466.9226`, `25.0` -> `25`.
+fn format_float(value: f64) -> String {
+    let mut s = format!("{value:.4}");
+    while s.ends_with('0') {
+        s.pop();
+    }
+    if s.ends_with('.') {
+        s.pop();
+    }
+    s
 }
 
 /// A parse failure with the 1-based byte column into the input where it was
@@ -463,5 +566,55 @@ mod tests {
         let e = parse(&input).unwrap_err();
         assert_eq!(e.column, 7);
         assert_eq!(e.message, "invalid UTF-8");
+    }
+
+    fn render(value: &Json) -> String {
+        let mut out = Vec::new();
+        value.write(&mut out).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn json_writer_renders_empty_containers_inline() {
+        assert_eq!(render(&Json::Array(vec![])), "[]");
+        assert_eq!(render(&Json::Object(vec![])), "{}");
+    }
+
+    #[test]
+    fn json_writer_indents_nested_containers() {
+        let value = Json::Object(vec![
+            ("name", Json::Str("a".to_string())),
+            ("items", Json::Array(vec![Json::UInt(1), Json::UInt(2)])),
+        ]);
+        assert_eq!(
+            render(&value),
+            "{\n  \"name\": \"a\",\n  \"items\": [\n    1,\n    2\n  ]\n}",
+        );
+    }
+
+    #[test]
+    fn json_writer_round_trips_through_the_parser() {
+        let value = Json::Object(vec![
+            ("count", Json::UInt(3)),
+            ("ok", Json::Bool(true)),
+            ("mean", Json::Float(466.9226)),
+        ]);
+        let rendered = render(&value);
+        let parsed = parse(rendered.as_bytes()).unwrap();
+        assert_eq!(parsed.get("count"), Some(&Value::Int(3)));
+        assert_eq!(parsed.get("ok"), Some(&Value::Bool(true)));
+        assert_eq!(parsed.get("mean"), Some(&Value::Float(466.9226)));
+    }
+
+    #[test]
+    fn json_writer_escapes_strings() {
+        assert_eq!(render(&Json::Str("a\"b\\c\n".to_string())), "\"a\\\"b\\\\c\\n\"");
+    }
+
+    #[test]
+    fn format_float_trims_trailing_zeros_and_the_bare_dot() {
+        assert_eq!(format_float(466.9226), "466.9226");
+        assert_eq!(format_float(25.0), "25");
+        assert_eq!(format_float(0.5), "0.5");
     }
 }
