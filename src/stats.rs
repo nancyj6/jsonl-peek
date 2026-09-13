@@ -17,6 +17,12 @@ use crate::path::FieldPath;
 /// cardinality (free text, a UUID).
 const MAX_DISTINCT_VALUES: usize = 10_000;
 
+/// Cap on distinct top-level keys tracked, matching the README's promise
+/// that the key table stops growing rather than holding one entry per key of
+/// a file whose records do not share a schema (each one a bag of arbitrary
+/// per-record fields).
+const MAX_KEYS: usize = 512;
+
 /// Knobs for a `Stats` run. `max_errors` bounds `Stats::issues`, per the
 /// README's promise that the error list stops growing rather than holding
 /// one entry per broken line in a file that is mostly broken.
@@ -77,8 +83,58 @@ pub struct Stats {
     /// excluded since a length-0 entry would just drag `min` to 0 without
     /// telling you anything about record size.
     pub line_length: Histogram,
+    /// Number of valid records whose top-level value is an object; the
+    /// denominator behind each key's `rate` in `top_level_keys`.
+    pub object_records: usize,
+    pub top_level_keys: KeyTable,
     /// One entry per `--field` path, in the order given on the command line.
     pub fields: Vec<FieldStats>,
+}
+
+/// Count and type breakdown of one top-level object key, as tracked by
+/// `KeyTable`.
+#[derive(Default)]
+pub struct KeyStats {
+    pub count: u64,
+    pub types: TypeCounts,
+}
+
+/// Tracks how often each key appears across the top-level objects in a
+/// file, and what type of value it held each time. Bounded at
+/// `MAX_KEYS` distinct keys, per the README's memory promise.
+#[derive(Default)]
+pub struct KeyTable {
+    keys: HashMap<String, KeyStats>,
+    /// Set once `keys` has reached `MAX_KEYS` and a key not already in the
+    /// table is seen.
+    pub truncated: bool,
+}
+
+impl KeyTable {
+    fn record(&mut self, key: &str, value: &Value) {
+        if let Some(stats) = self.keys.get_mut(key) {
+            stats.count += 1;
+            stats.types.record(value.type_name());
+            return;
+        }
+        if self.keys.len() >= MAX_KEYS {
+            self.truncated = true;
+            return;
+        }
+        let mut stats = KeyStats::default();
+        stats.count = 1;
+        stats.types.record(value.type_name());
+        self.keys.insert(key.to_string(), stats);
+    }
+
+    /// Key/stats pairs, most frequent first, ties broken by key text so the
+    /// order is deterministic.
+    pub fn most_common(&self) -> Vec<(&str, &KeyStats)> {
+        let mut sorted: Vec<(&str, &KeyStats)> =
+            self.keys.iter().map(|(key, stats)| (key.as_str(), stats)).collect();
+        sorted.sort_unstable_by(|a, b| b.1.count.cmp(&a.1.count).then_with(|| a.0.cmp(b.0)));
+        sorted
+    }
 }
 
 /// Distribution of one `--field` path's matches across all valid records.
@@ -186,6 +242,8 @@ impl Stats {
             issues_truncated: false,
             top_level_types: TypeCounts::default(),
             line_length: Histogram::new(),
+            object_records: 0,
+            top_level_keys: KeyTable::default(),
             fields: options.fields.into_iter().map(FieldStats::new).collect(),
         };
 
@@ -200,6 +258,12 @@ impl Stats {
                 Ok(value) => {
                     stats.valid += 1;
                     stats.top_level_types.record(value.type_name());
+                    if let Some(members) = value.as_object() {
+                        stats.object_records += 1;
+                        for (key, member) in members {
+                            stats.top_level_keys.record(key, member);
+                        }
+                    }
                     for field in &mut stats.fields {
                         let matches = field.path.select(&value);
                         if !matches.is_empty() {
@@ -365,6 +429,41 @@ mod tests {
         assert_eq!(field.distinct(), MAX_DISTINCT_VALUES);
         assert!(field.values_truncated);
         assert_eq!(field.value_count, (MAX_DISTINCT_VALUES + 1) as u64);
+    }
+
+    #[test]
+    fn top_level_keys_are_counted_with_rate_and_types() {
+        let stats = run(b"{\"id\":1,\"tags\":[\"a\"]}\n{\"id\":2}\n{\"id\":3}\n");
+        assert_eq!(stats.object_records, 3);
+        let keys = stats.top_level_keys.most_common();
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].0, "id");
+        assert_eq!(keys[0].1.count, 3);
+        assert_eq!(keys[0].1.types.most_common(), vec![("int", 3)]);
+        assert_eq!(keys[1].0, "tags");
+        assert_eq!(keys[1].1.count, 1);
+        assert_eq!(keys[1].1.types.most_common(), vec![("array", 1)]);
+    }
+
+    #[test]
+    fn top_level_keys_skip_non_object_and_invalid_records() {
+        let stats = run(b"[1,2]\nnot json\n{\"a\":1}\n");
+        assert_eq!(stats.object_records, 1);
+        let keys = stats.top_level_keys.most_common();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].0, "a");
+        assert_eq!(keys[0].1.count, 1);
+    }
+
+    #[test]
+    fn top_level_key_table_truncates_at_the_key_cap() {
+        let mut input = String::new();
+        for i in 0..(MAX_KEYS + 1) {
+            input.push_str(&format!("{{\"k{i}\":1}}\n"));
+        }
+        let stats = run(input.as_bytes());
+        assert_eq!(stats.top_level_keys.most_common().len(), MAX_KEYS);
+        assert!(stats.top_level_keys.truncated);
     }
 
     #[test]

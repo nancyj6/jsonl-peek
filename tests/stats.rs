@@ -60,6 +60,21 @@ fn stats_max_errors_limits_the_reported_issues_but_not_the_total() {
 }
 
 #[test]
+fn stats_reports_top_level_keys_with_rate_and_types() {
+    let stdout = stats_on(
+        b"{\"id\":1,\"tags\":[\"a\"]}\n{\"id\":2}\n{\"id\":3}\n",
+        &[],
+    );
+    assert!(stdout.contains("top level keys over 3 objects"));
+    assert!(stdout.contains("100.0%"));
+    assert!(stdout.contains("int:3"));
+    assert!(stdout.contains("33.3%"));
+    assert!(stdout.contains("array:1"));
+    // "id" (present in every record) is listed before "tags".
+    assert!(stdout.find("\n  id ").unwrap() < stdout.find("\n  tags ").unwrap());
+}
+
+#[test]
 fn stats_field_reports_presence_and_top_values() {
     let stdout = stats_on(
         b"{\"role\":\"user\"}\n{\"role\":\"assistant\"}\n{\"role\":\"user\"}\n",
@@ -120,6 +135,15 @@ fn stats_json_output_is_valid_json_with_the_expected_fields() {
     assert_eq!(value.get("invalid"), Some(&Value::Int(1)));
     assert_eq!(value.get("valid"), Some(&Value::Int(2)));
     assert_eq!(value.get("top_level_types").unwrap().get("object"), Some(&Value::Int(2)));
+
+    let top_level_keys = value.get("top_level_keys").unwrap();
+    assert_eq!(top_level_keys.get("object_records"), Some(&Value::Int(2)));
+    assert_eq!(top_level_keys.get("truncated"), Some(&Value::Bool(false)));
+    let keys = top_level_keys.get("keys").unwrap().as_array().unwrap();
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0].get("key"), Some(&Value::String("role".to_string())));
+    assert_eq!(keys[0].get("count"), Some(&Value::Int(2)));
+    assert_eq!(keys[0].get("types").unwrap().get("string"), Some(&Value::Int(2)));
 
     let fields = value.get("fields").unwrap().as_array().unwrap();
     assert_eq!(fields.len(), 1);

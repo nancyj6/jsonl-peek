@@ -9,7 +9,7 @@ use jsonl_peek::json::Json;
 use jsonl_peek::lines::LineReader;
 use jsonl_peek::path::FieldPath;
 use jsonl_peek::rng::{Reservoir, SplitMix64};
-use jsonl_peek::stats::{FieldStats, Issue, Stats, StatsOptions};
+use jsonl_peek::stats::{FieldStats, Issue, KeyStats, Stats, StatsOptions};
 
 fn main() -> ExitCode {
     match run() {
@@ -318,6 +318,7 @@ fn stats_to_json(stats: &Stats, top: usize, file_label: &str, bytes: Option<u64>
     }
     members.push(("top_level_types", type_counts_json(&stats.top_level_types.most_common())));
     members.push(("line_length", line_length_json(&stats.line_length)));
+    members.push(("top_level_keys", top_level_keys_json(stats)));
     members.push(("fields", Json::Array(stats.fields.iter().map(|field| field_json(field, top)).collect())));
     members.push(("issues", Json::Array(stats.issues.iter().map(issue_json).collect())));
     members.push(("issues_truncated", Json::Bool(stats.issues_truncated)));
@@ -337,6 +338,22 @@ fn line_length_json(hist: &Histogram) -> Json {
         ("p99", Json::UInt(hist.percentile(0.99).unwrap_or(0))),
         ("max", Json::UInt(hist.max().unwrap_or(0))),
         ("mean", Json::Float(hist.mean().unwrap_or(0.0))),
+    ])
+}
+
+fn top_level_keys_json(stats: &Stats) -> Json {
+    Json::Object(vec![
+        ("object_records", Json::UInt(stats.object_records as u64)),
+        ("truncated", Json::Bool(stats.top_level_keys.truncated)),
+        ("keys", Json::Array(stats.top_level_keys.most_common().into_iter().map(key_stats_json).collect())),
+    ])
+}
+
+fn key_stats_json((key, stats): (&str, &KeyStats)) -> Json {
+    Json::Object(vec![
+        ("key", Json::Str(key.to_string())),
+        ("count", Json::UInt(stats.count)),
+        ("types", type_counts_json(&stats.types.most_common())),
     ])
 }
 
@@ -405,6 +422,27 @@ fn print_stats<W: Write>(
             stats.line_length.max().unwrap_or(0),
             stats.line_length.mean().unwrap_or(0.0),
         )?;
+    }
+
+    if stats.object_records > 0 {
+        writeln!(out)?;
+        writeln!(
+            out,
+            "top level keys over {} objects{}",
+            format_count(stats.object_records as u64),
+            if stats.top_level_keys.truncated { " (truncated)" } else { "" },
+        )?;
+        writeln!(out, "  {:<28} {:>8}  {:>6}  types", "key", "count", "rate")?;
+        for (key, key_stats) in stats.top_level_keys.most_common() {
+            writeln!(
+                out,
+                "  {:<28} {:>8}  {:>6}  {}",
+                key,
+                format_count(key_stats.count),
+                percent(key_stats.count as usize, stats.object_records),
+                join_type_counts(&key_stats.types.most_common()),
+            )?;
+        }
     }
 
     for field in &stats.fields {
