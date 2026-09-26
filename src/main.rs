@@ -9,6 +9,7 @@ use jsonl_peek::json::Json;
 use jsonl_peek::lines::LineReader;
 use jsonl_peek::path::FieldPath;
 use jsonl_peek::rng::{Reservoir, SplitMix64};
+use jsonl_peek::schema::{PathEntry, Schema, SchemaOptions};
 use jsonl_peek::stats::{FieldStats, Issue, KeyStats, Stats, StatsOptions};
 
 fn main() -> ExitCode {
@@ -50,6 +51,14 @@ fn run() -> io::Result<ExitCode> {
         },
         "stats" => match parse_stats_args(args) {
             Ok(parsed) => run_stats(parsed),
+            Err(msg) => {
+                eprintln!("jsonl-peek: {msg}");
+                usage();
+                Ok(ExitCode::from(2))
+            }
+        },
+        "schema" => match parse_schema_args(args) {
+            Ok(parsed) => run_schema(parsed),
             Err(msg) => {
                 eprintln!("jsonl-peek: {msg}");
                 usage();
@@ -479,6 +488,120 @@ fn print_stats<W: Write>(
     Ok(())
 }
 
+struct SchemaArgs {
+    depth: usize,
+    min_rate: f64,
+    json: bool,
+    file: Option<String>,
+}
+
+fn parse_schema_args(mut args: impl Iterator<Item = String>) -> Result<SchemaArgs, String> {
+    let mut depth = 3usize;
+    let mut min_rate = 0.0f64;
+    let mut json = false;
+    let mut file = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--depth" => {
+                let value = args.next().ok_or_else(|| "--depth requires a value".to_string())?;
+                depth = value.parse().map_err(|_| format!("invalid depth '{value}'"))?;
+            }
+            "--min-rate" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--min-rate requires a value".to_string())?;
+                min_rate = value.parse().map_err(|_| format!("invalid rate '{value}'"))?;
+            }
+            "--json" => json = true,
+            "-" => file = Some(arg),
+            _ if arg.starts_with('-') => return Err(format!("unknown option '{arg}'")),
+            _ if file.is_some() => return Err("too many file arguments".to_string()),
+            _ => file = Some(arg),
+        }
+    }
+    Ok(SchemaArgs { depth, min_rate, json, file })
+}
+
+fn run_schema(args: SchemaArgs) -> io::Result<ExitCode> {
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    let depth = args.depth;
+    let json = args.json;
+    let options = SchemaOptions { depth: args.depth, min_rate: args.min_rate };
+
+    match args.file.as_deref() {
+        Some(path) if path != "-" => {
+            let file = File::open(path)
+                .map_err(|err| io::Error::new(err.kind(), format!("{path}: {err}")))?;
+            let schema = Schema::from_reader(BufReader::new(file), options)?;
+            if json {
+                print_schema_json(&schema, &mut out)?;
+            } else {
+                print_schema(&schema, depth, &mut out)?;
+            }
+        }
+        _ => {
+            let stdin = io::stdin();
+            let schema = Schema::from_reader(stdin.lock(), options)?;
+            if json {
+                print_schema_json(&schema, &mut out)?;
+            } else {
+                print_schema(&schema, depth, &mut out)?;
+            }
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn print_schema_json<W: Write>(schema: &Schema, out: &mut W) -> io::Result<()> {
+    schema_to_json(schema).write(out)?;
+    writeln!(out)
+}
+
+fn schema_to_json(schema: &Schema) -> Json {
+    Json::Object(vec![
+        ("records", Json::UInt(schema.records as u64)),
+        ("unparseable", Json::UInt(schema.unparseable as u64)),
+        ("truncated", Json::Bool(schema.truncated)),
+        ("paths", Json::Array(schema.paths().into_iter().map(path_entry_json).collect())),
+    ])
+}
+
+fn path_entry_json((path, entry): (&str, &PathEntry)) -> Json {
+    Json::Object(vec![
+        ("path", Json::Str(path.to_string())),
+        ("records_present", Json::UInt(entry.records_present as u64)),
+        ("types", type_counts_json(&entry.types.most_common())),
+    ])
+}
+
+fn print_schema<W: Write>(schema: &Schema, depth: usize, out: &mut W) -> io::Result<()> {
+    writeln!(
+        out,
+        "{} records, depth {}{}",
+        format_count(schema.records as u64),
+        depth,
+        if schema.truncated { " (path table truncated)" } else { "" },
+    )?;
+    writeln!(out)?;
+    writeln!(out, "  {:<40} {:>6}  types", "path", "rate")?;
+    for (path, entry) in schema.paths() {
+        writeln!(
+            out,
+            "  {:<40} {:>6}  {}",
+            path,
+            percent(entry.records_present, schema.records),
+            join_type_counts(&entry.types.most_common()),
+        )?;
+    }
+
+    if schema.unparseable > 0 {
+        writeln!(out)?;
+        writeln!(out, "{} unparseable lines skipped", format_count(schema.unparseable as u64))?;
+    }
+    Ok(())
+}
+
 fn join_type_counts(counts: &[(&str, u64)]) -> String {
     counts
         .iter()
@@ -530,6 +653,7 @@ fn usage() {
     eprintln!("usage: jsonl-peek head   [-n N] [FILE]");
     eprintln!("       jsonl-peek sample [-n N] [--seed S] [FILE]");
     eprintln!("       jsonl-peek stats  [--field PATH]... [--top N] [--max-errors N] [--json] [FILE]");
+    eprintln!("       jsonl-peek schema [--depth N] [--min-rate R] [--json] [FILE]");
 }
 
 #[cfg(test)]
